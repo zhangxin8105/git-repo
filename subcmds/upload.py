@@ -1,4 +1,5 @@
 # Copyright (C) 2008 The Android Open Source Project
+# Copyright (C) 2022 Known Rabbit
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -56,6 +57,7 @@ def _SplitEmails(values):
 
 class Upload(InteractiveCommand):
   COMMON = True
+  GERRIT = True
   helpSummary = "Upload changes for code review"
   helpUsage = """
 %prog [--re --cc] [<project>]...
@@ -240,10 +242,11 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
       date = branch.date
       commit_list = branch.commits
 
-      destination = opt.dest_branch or project.dest_branch or project.revisionExpr
+      push_branch = None if self.GERRIT else branch.branch.merge
+      destination = opt.dest_branch or push_branch or project.dest_branch or project.revisionExpr
       print('Upload project %s/ to remote branch %s%s:' %
             (project.RelPath(local=opt.this_manifest_only), destination,
-             ' (private)' if opt.private else ''))
+             ' (private)' if self.GERRIT and opt.private else ''))
       print('  branch %s (%2d commit%s, %s):' % (
           name,
           len(commit_list),
@@ -292,7 +295,13 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
 
         if b:
           script.append('#')
-        destination = opt.dest_branch or project.dest_branch or project.revisionExpr
+        # TODO: The destination branch name is calculated twice in this file
+        #       and again in project.py.  This is not DRY.  Further, the
+        #       calculations are different.  The value calculated here is merely
+        #       used in a message.  The project.py value is actually used in a
+        #       git command and is therefore probably more reliable.
+        push_branch = None if self.GERRIT else branch.branch.merge
+        destination = opt.dest_branch or push_branch or project.dest_branch or project.revisionExpr
         script.append('#  branch %s (%2d commit%s, %s) to remote branch %s:' % (
                       name,
                       len(commit_list),
@@ -417,40 +426,41 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
               branch.error = 'User aborted'
               continue
 
-        # Check if topic branches should be sent to the server during upload
-        if opt.auto_topic is not True:
-          key = 'review.%s.uploadtopic' % branch.project.remote.review
-          opt.auto_topic = branch.project.config.GetBoolean(key)
+        if self.GERRIT:
+          # Check if topic branches should be sent to the server during upload
+          if opt.auto_topic is not True:
+            key = 'review.%s.uploadtopic' % branch.project.remote.review
+            opt.auto_topic = branch.project.config.GetBoolean(key)
 
-        def _ExpandCommaList(value):
-          """Split |value| up into comma delimited entries."""
-          if not value:
-            return
-          for ret in value.split(','):
-            ret = ret.strip()
-            if ret:
-              yield ret
+          def _ExpandCommaList(value):
+            """Split |value| up into comma delimited entries."""
+            if not value:
+              return
+            for ret in value.split(','):
+              ret = ret.strip()
+              if ret:
+                yield ret
 
-        # Check if hashtags should be included.
-        key = 'review.%s.uploadhashtags' % branch.project.remote.review
-        hashtags = set(_ExpandCommaList(branch.project.config.GetString(key)))
-        for tag in opt.hashtags:
-          hashtags.update(_ExpandCommaList(tag))
-        if opt.hashtag_branch:
-          hashtags.add(branch.name)
+          # Check if hashtags should be included.
+          key = 'review.%s.uploadhashtags' % branch.project.remote.review
+          hashtags = set(_ExpandCommaList(branch.project.config.GetString(key)))
+          for tag in opt.hashtags:
+            hashtags.update(_ExpandCommaList(tag))
+          if opt.hashtag_branch:
+            hashtags.add(branch.name)
 
-        # Check if labels should be included.
-        key = 'review.%s.uploadlabels' % branch.project.remote.review
-        labels = set(_ExpandCommaList(branch.project.config.GetString(key)))
-        for label in opt.labels:
-          labels.update(_ExpandCommaList(label))
+          # Check if labels should be included.
+          key = 'review.%s.uploadlabels' % branch.project.remote.review
+          labels = set(_ExpandCommaList(branch.project.config.GetString(key)))
+          for label in opt.labels:
+            labels.update(_ExpandCommaList(label))
 
-        # Handle e-mail notifications.
-        if opt.notify is False:
-          notify = 'NONE'
-        else:
-          key = 'review.%s.uploadnotify' % branch.project.remote.review
-          notify = branch.project.config.GetString(key)
+          # Handle e-mail notifications.
+          if opt.notify is False:
+            notify = 'NONE'
+          else:
+            key = 'review.%s.uploadnotify' % branch.project.remote.review
+            notify = branch.project.config.GetString(key)
 
         destination = opt.dest_branch or branch.project.dest_branch
 
@@ -469,19 +479,23 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
                   % destination)
             branch.uploaded = False
             continue
-
-        branch.UploadForReview(people,
-                               dryrun=opt.dryrun,
-                               auto_topic=opt.auto_topic,
-                               hashtags=hashtags,
-                               labels=labels,
-                               private=opt.private,
-                               notify=notify,
-                               wip=opt.wip,
-                               ready=opt.ready,
-                               dest_branch=destination,
-                               validate_certs=opt.validate_certs,
-                               push_options=opt.push_options)
+        if self.GERRIT:
+          branch.UploadForReview(people,
+                                 dryrun=opt.dryrun,
+                                 auto_topic=opt.auto_topic,
+                                 hashtags=hashtags,
+                                 labels=labels,
+                                 private=opt.private,
+                                 notify=notify,
+                                 wip=opt.wip,
+                                 ready=opt.ready,
+                                 dest_branch=destination,
+                                 validate_certs=opt.validate_certs,
+                                 push_options=opt.push_options)
+        else:
+          branch.Push(dryrun=opt.dryrun,
+                      dest_branch=destination,
+                      push_options=opt.push_options)
 
         branch.uploaded = True
       except UploadError as e:
@@ -543,7 +557,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     return (project, avail)
 
   def Execute(self, opt, args):
-    projects = self.GetProjects(args, all_manifests=not opt.this_manifest_only)
+    projects = self.GetProjects(args, all_manifests=not opt.this_manifest_only, sort=self.GERRIT)
 
     def _ProcessResults(_pool, _out, results):
       pending = []
@@ -584,7 +598,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
                            if project.manifest.topdir == manifest.topdir]
       hook = RepoHook.FromSubcmd(
           hook_type='pre-upload', manifest=manifest,
-          opt=opt, abort_if_user_denies=True)
+          opt=opt, abort_if_user_denies=True, bypass_hooks=not self.GERRIT)
       if not hook.Run(
           project_list=pending_proj_names,
           worktree_list=pending_worktrees):
@@ -592,9 +606,12 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
     if ret:
       return ret
 
-    reviewers = _SplitEmails(opt.reviewers) if opt.reviewers else []
-    cc = _SplitEmails(opt.cc) if opt.cc else []
-    people = (reviewers, cc)
+    if self.GERRIT:
+      reviewers = _SplitEmails(opt.reviewers) if opt.reviewers else []
+      cc = _SplitEmails(opt.cc) if opt.cc else []
+      people = (reviewers, cc)
+    else:
+      people = ([], [])
 
     if len(pending) == 1 and len(pending[0][1]) == 1:
       self._SingleBranch(opt, pending[0][1][0], people)

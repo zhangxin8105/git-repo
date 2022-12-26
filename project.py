@@ -1,4 +1,5 @@
 # Copyright (C) 2008 The Android Open Source Project
+# Copyright (C) 2022 Known Rabbit
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -169,6 +170,19 @@ class ReviewableBranch(object):
         if self.base_exists:
           raise
 
+    if self._commit_cache is None:
+      default_remote = R_M + (self.project.remote.revision or self.project.manifest._default.revisionExpr[len(R_HEADS):])
+      args = ('--abbrev=8', '--abbrev-commit', '--pretty=oneline', '--reverse',
+              '--date-order', not_rev(default_remote), R_HEADS + self.name, '--')
+      try:
+        self._commit_cache = self.project.bare_git.rev_list(*args)
+      except GitError:
+        # We weren't able to probe the commits for this branch.  Was it tracking
+        # a branch that no longer exists?  If so, return no commits.  Otherwise,
+        # rethrow the error as we don't know what's going on.
+        if self.base_exists:
+          raise
+
         self._commit_cache = []
 
     return self._commit_cache
@@ -231,6 +245,15 @@ class ReviewableBranch(object):
                                  dest_branch=dest_branch,
                                  validate_certs=validate_certs,
                                  push_options=push_options)
+
+  def Push(self,
+           dryrun=False,
+           dest_branch=None,
+           push_options=None):
+    self.project.Push(self.name,
+                      dryrun=dryrun,
+                      dest_branch=dest_branch,
+                      push_options=push_options)
 
   def GetPublishedRefs(self):
     refs = {}
@@ -1099,6 +1122,62 @@ class Project(object):
 
     if not dryrun:
       msg = "posted to %s for %s" % (branch.remote.review, dest_branch)
+      self.bare_git.UpdateRef(R_PUB + branch.name,
+                              R_HEADS + branch.name,
+                              message=msg)
+
+  def Push(self, branch=None,
+           dryrun=False,
+           dest_branch=None,
+           push_options=None):
+    """Uploads the named branch for code review.
+    """
+    if branch is None:
+      branch = self.CurrentBranch
+    if branch is None:
+      raise GitError('not currently on a branch')
+
+    branch = self.GetBranch(branch)
+    if not branch.LocalMerge:
+      # TODO: If we should setup a remote tracking branch?
+      raise GitError('branch %s does not track a remote' % branch.name)
+
+    if dest_branch is None:
+      dest_branch = self.dest_branch
+    if dest_branch is None:
+      dest_branch = branch.merge
+    if not dest_branch.startswith(R_HEADS):
+      dest_branch = R_HEADS + dest_branch
+
+    if not branch.remote.projectname:
+      branch.remote.projectname = self.name
+      branch.remote.Save()
+
+    url = branch.remote.pushUrl or branch.remote.url
+    if url is None:
+      raise UploadError("no remote 'url' or 'pushurl' is defined in the git configuration")
+    cmd = ['push']
+    if dryrun:
+      cmd.append('-n')
+
+    for push_option in (push_options or []):
+      cmd.append('-o')
+      cmd.append(push_option)
+
+    cmd.append(url)
+
+    if dest_branch.startswith(R_HEADS):
+      dest_branch = dest_branch[len(R_HEADS):]
+
+    ref_spec = '%s%s:%s%s' % (R_HEADS, branch.name,
+                              R_HEADS, dest_branch)
+    cmd.append(ref_spec)
+
+    if GitCommand(self, cmd, bare=True).Wait() != 0:
+      raise UploadError('Upload failed')
+
+    if not dryrun:
+      msg = "posted to %s for %s" % (branch.remote.url, dest_branch)
       self.bare_git.UpdateRef(R_PUB + branch.name,
                               R_HEADS + branch.name,
                               message=msg)
